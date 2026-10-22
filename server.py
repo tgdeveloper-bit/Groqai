@@ -104,6 +104,7 @@ async def proxy_chat(request: Request, x_proxy_key: str = Header(None)):
 async def health():
     return {
         "status": "ok",
+        "version": "new",
         "proxy_id": PROXY_ID,
         "text_model": GROQ_TEXT_MODEL,
         "vision_model": GROQ_VISION_MODEL,
