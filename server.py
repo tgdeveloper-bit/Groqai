@@ -8,11 +8,16 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 # ============ CONFIG FROM ENV ============
-PROXY_ID = os.getenv("PROXY_ID", "proxy_unknown")              # unique id per proxy
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")                       # per-proxy Groq key
-PROXY_SECRET   = os.getenv("PROXY_SECRET", "")                       # shared secret with agent
-GROQ_MODEL     = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")     # model per proxy
-GROQ_URL       = "https://api.groq.com/openai/v1/chat/completions"
+PROXY_ID      = os.getenv("PROXY_ID", "proxy_unknown")
+GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
+PROXY_SECRET  = os.getenv("PROXY_SECRET", "")
+
+# ============ MODELS (HARDCODED) ============
+# এগুলো env-এ রাখার দরকার নেই — ৬ সার্ভারে একই
+GROQ_TEXT_MODEL   = "openai/gpt-oss-120b"
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # ============ HTTP CLIENT ============
 http_client: httpx.AsyncClient = None
@@ -21,12 +26,28 @@ http_client: httpx.AsyncClient = None
 async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(timeout=60.0)
-    print(f"[{PROXY_ID}] started | model={GROQ_MODEL} | groq_key={'SET' if GROQ_API_KEY else 'MISSING'}")
+    print(f"[{PROXY_ID}] started | text={GROQ_TEXT_MODEL} | vision={GROQ_VISION_MODEL} | groq_key={'SET' if GROQ_API_KEY else 'MISSING'}")
     yield
     await http_client.aclose()
     print(f"[{PROXY_ID}] stopped")
 
 app = FastAPI(title=f"AI Proxy {PROXY_ID}", lifespan=lifespan)
+
+
+def has_image_content(messages) -> bool:
+    """OpenAI-style messages এ image_url আছে কিনা"""
+    if not isinstance(messages, list):
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    return True
+    return False
+
 
 # ============ MAIN ENDPOINT ============
 @app.post("/chat/completions")
@@ -45,8 +66,13 @@ async def proxy_chat(request: Request, x_proxy_key: str = Header(None)):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    # 3. Force model from env (agent can send anything, proxy overrides)
-    body["model"] = GROQ_MODEL
+    # 3. 🔀 Text vs Vision auto-route
+    if has_image_content(body.get("messages")):
+        body["model"] = GROQ_VISION_MODEL
+        print(f"[{PROXY_ID}] → VISION: {GROQ_VISION_MODEL}")
+    else:
+        body["model"] = GROQ_TEXT_MODEL
+        print(f"[{PROXY_ID}] → TEXT: {GROQ_TEXT_MODEL}")
 
     # 4. Forward to Groq
     try:
@@ -72,15 +98,17 @@ async def proxy_chat(request: Request, x_proxy_key: str = Header(None)):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"[{PROXY_ID}] Proxy error: {str(e)}")
 
+
 # ============ HEALTH & INFO ============
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
         "proxy_id": PROXY_ID,
-        "model": GROQ_MODEL,
+        "text_model": GROQ_TEXT_MODEL,
+        "vision_model": GROQ_VISION_MODEL,
         "groq_configured": bool(GROQ_API_KEY),
-        "secret_configured": bool(PROXY_SECRET)
+        "secret_configured": bool(PROXY_SECRET),
     }
 
 @app.get("/")
@@ -89,13 +117,13 @@ async def root():
 
 @app.get("/my-ip")
 async def get_my_ip():
-    """Verify outbound IP — critical for multi-proxy setup"""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get("https://api.ipify.org?format=json")
             return {"proxy_id": PROXY_ID, **r.json()}
     except Exception as e:
         return {"proxy_id": PROXY_ID, "error": str(e)}
+
 
 # ============ RUN ============
 if __name__ == "__main__":
